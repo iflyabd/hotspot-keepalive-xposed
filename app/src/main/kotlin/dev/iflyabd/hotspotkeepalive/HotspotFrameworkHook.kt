@@ -90,7 +90,8 @@ object HotspotFrameworkHook {
                             val shouldBlock = if (thermalFlavor) ignoreThermal else (ignoreBattery || ignoreThermal)
                             if (!shouldBlock) return
                             XposedBridge.log("HotspotKeepalive: blocked $cls.$name")
-                            when (param.method.returnType) {
+                            val rt0 = (param.method as? java.lang.reflect.Method)?.returnType
+                            when (rt0) {
                                 Int::class.javaPrimitiveType, Integer::class.java -> param.result = 2 // START_NOT_STICKY
                                 Boolean::class.javaPrimitiveType -> param.result = false
                                 else -> param.result = null
@@ -141,7 +142,7 @@ object HotspotFrameworkHook {
                         }
                         if (!block) return
                         XposedBridge.log("HotspotKeepalive: veto SoftApManager.$n (reason=$reason)")
-                        val rt = param.method.returnType
+                        val rt = (param.method as? java.lang.reflect.Method)?.returnType
                         if (rt == Boolean::class.javaPrimitiveType || rt == java.lang.Boolean::class.java) {
                             // check* / should* returning "should shut down?" -> answer no.
                             if (n.startsWith("check") || n.startsWith("should") || n.startsWith("is")) {
