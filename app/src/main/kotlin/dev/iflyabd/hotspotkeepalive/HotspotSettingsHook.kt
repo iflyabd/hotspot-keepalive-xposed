@@ -34,6 +34,14 @@ object HotspotSettingsHook {
     private const val KEY_ONBOOT = "hotspot_keepalive_onboot"
     private const val OBSERVER_TAG = "hotspot_keepalive_observer"
 
+    /** Stock auto-off keys: AOSP + OPlus variants. Injection anchors below whichever is present. */
+    private val ANCHORS = listOf(
+        "wifi_tether_auto_turn_off",
+        "wifi_ap_timeout_auto_close",
+        "oplus_wifi_ap_timeout_auto_close",
+        "static_ap_wifi_auto_close_switch",
+    )
+
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
         val injectHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
@@ -89,6 +97,46 @@ object HotspotSettingsHook {
             )
         } catch (_: Throwable) {
         }
+        // OPlus COUI panel (hotspot settings in WirelessSettings).
+        try {
+            XposedHelpers.findAndHookMethod(
+                "com.coui.appcompat.panel.COUIPanelFragment",
+                lpparam.classLoader,
+                "onStart",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            logScreen("coui", param.thisObject)
+                            maybeInject(param.thisObject, lpparam)
+                        } catch (e: Throwable) {
+                            XposedBridge.log("HotspotKeepalive: coui inject failed: $e")
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("HotspotKeepalive: COUIPanelFragment hook installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: COUIPanelFragment hook failed: $e")
+        }
+        // Generic fragment discovery: log hotspot-ish screens we don't otherwise cover.
+        try {
+            XposedHelpers.findAndHookMethod(
+                "androidx.fragment.app.Fragment",
+                lpparam.classLoader,
+                "onStart",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            logScreen("frag", param.thisObject)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("HotspotKeepalive: androidx Fragment discovery hook installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: androidx Fragment hook failed: $e")
+        }
         hookTetherFragmentDirect(lpparam)
     }
 
@@ -119,11 +167,15 @@ object HotspotSettingsHook {
     }
 
     private fun maybeInject(fragment: Any, lpparam: XC_LoadPackage.LoadPackageParam) {
+        logScreen("inject", fragment)
         val screen = XposedHelpers.callMethod(fragment, "getPreferenceScreen") ?: return
-        // Anchor: stock auto-off toggle. If absent this is not the hotspot screen.
+        // Anchor: stock auto-off toggle (AOSP or OPlus key). If absent this is not
+        // the hotspot screen.
         // NOTE: we never modify or remove the anchor — only add below it — so the
         // stock hotspot switch keeps working exactly as before.
-        if (XposedHelpers.callMethod(screen, "findPreference", ANCHOR_KEY) == null) return
+        val anchor = ANCHORS.firstOrNull { key ->
+            XposedHelpers.callMethod(screen, "findPreference", key) != null
+        } ?: return
         val context = XposedHelpers.callMethod(screen, "getContext") as Context
 
         var added = 0
@@ -167,7 +219,7 @@ object HotspotSettingsHook {
         var anchorOrder = Int.MAX_VALUE
         for (i in 0 until count) {
             val p = XposedHelpers.callMethod(screen, "getPreference", i)
-            if ((XposedHelpers.callMethod(p, "getKey") as? String) == ANCHOR_KEY) {
+            if ((XposedHelpers.callMethod(p, "getKey") as? String) == anchor) {
                 anchorOrder = XposedHelpers.callMethod(p, "getOrder") as Int
                 break
             }
@@ -259,8 +311,49 @@ object HotspotSettingsHook {
         }
     }
 
-    private fun cleanup(fragment: Any) {
-        val observer = XposedHelpers.getAdditionalInstanceField(fragment, OBSERVER_TAG)
+    /** Discovery: log fragment class + preference keys so we can anchor correctly. */
+    private fun logScreen(tag: String, fragment: Any) {
+        try {
+            val cls = fragment.javaClass.name
+            val interesting = cls.contains("tether", true) || cls.contains("hotspot", true) ||
+                cls.contains("wireless", true) || cls.contains("softap", true) ||
+                cls.contains("wifiap", true) || cls.contains("panel", true) ||
+                cls.contains("wlan", true)
+            val screen = try {
+                XposedHelpers.callMethod(fragment, "getPreferenceScreen")
+            } catch (_: Throwable) {
+                null
+            }
+            if (screen == null) {
+                if (interesting) {
+                    XposedBridge.log("HotspotKeepalive: [$tag] $cls has NO preference screen")
+                }
+                return
+            }
+            val keys = mutableListOf<String>()
+            try {
+                val count = XposedHelpers.callMethod(screen, "getPreferenceCount") as Int
+                for (i in 0 until count) {
+                    val p = XposedHelpers.callMethod(screen, "getPreference", i)
+                    keys += (XposedHelpers.callMethod(p, "getKey") as? String)
+                        ?: "<nokey>:${p.javaClass.name.substringAfterLast('.')}"
+                }
+            } catch (e: Throwable) {
+                keys += "ITER_FAIL:$e"
+            }
+            val present = ANCHORS.filter { a -> keys.any { it == a } }
+            if (interesting || present.isNotEmpty()) {
+                XposedBridge.log(
+                    "HotspotKeepalive: [$tag] $cls anchors=$present " +
+                        "keys=${keys.joinToString(",").take(1500)}",
+                )
+            }
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: [$tag] logScreen failed: $e")
+        }
+    }
+
+    private fun cleanup(fragment: Any) {        val observer = XposedHelpers.getAdditionalInstanceField(fragment, OBSERVER_TAG)
             as? ContentObserver ?: return
         try {
             val context = XposedHelpers.callMethod(fragment, "getContext") as? Context
