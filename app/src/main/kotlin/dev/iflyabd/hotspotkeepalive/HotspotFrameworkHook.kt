@@ -34,6 +34,7 @@ object HotspotFrameworkHook {
         if (lpparam.packageName == "android") {
             hookSoftApManager(lpparam)
             hookWifiServiceStop(lpparam)
+            hookBootAutoStart(lpparam)
         }
     }
 
@@ -115,6 +116,14 @@ object HotspotFrameworkHook {
             for (m in clazz.declaredMethods) {
                 val n = m.name
                 val ln = n.lowercase()
+                // Never touch start/config/capability/register/update paths — those run
+                // when the user TURNS HOTSPOT ON. Only shutdown-side methods qualify,
+                // so enabling hotspot from QS or Settings can never be blocked.
+                if (ln.contains("start") || ln.contains("config") || ln.contains("capability") ||
+                    ln.contains("register") || ln.contains("update")
+                ) {
+                    continue
+                }
                 val looksShutdown = ln.contains("shutdown") || ln.contains("shouldstop") ||
                     ln.contains("autoshutdown") || ln.contains("checksoftap") ||
                     ln.contains("lowbattery") || ln.contains("thermal") ||
@@ -200,5 +209,75 @@ object HotspotFrameworkHook {
         }
         if (l.contains("idle") || l.contains("timeout") || l.contains("inactiv")) return Reason.IDLE
         return Reason.UNKNOWN
+    }
+
+    /** Boot: if "Turn on hotspot at boot" is ON, start tethered hotspot after boot. */
+    private fun hookBootAutoStart(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            XposedBridge.hookAllMethods(
+                XposedHelpers.findClass("android.app.ActivityThread", lpparam.classLoader),
+                "handleBindApplication",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            registerBootReceiver()
+                        } catch (e: Throwable) {
+                            XposedBridge.log("HotspotKeepalive: boot receiver failed: $e")
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("HotspotKeepalive: boot hook installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: boot hook failed: $e")
+        }
+    }
+
+    private fun registerBootReceiver() {
+        val ctx = currentApp() ?: return
+        if (XposedHelpers.getAdditionalInstanceField(ctx, "hotspot_boot_registered") != null) return
+        XposedHelpers.setAdditionalInstanceField(ctx, "hotspot_boot_registered", true)
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: android.content.Intent) {
+                try {
+                    val onboot = android.provider.Settings.Global.getInt(
+                        c.contentResolver, HotspotHelper.KEY_ONBOOT, 0,
+                    ) == 1
+                    if (!onboot) return
+                    XposedBridge.log("HotspotKeepalive: boot: will auto-start hotspot in 45s")
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        try {
+                            startTetheredHotspot(c)
+                        } catch (e: Throwable) {
+                            XposedBridge.log("HotspotKeepalive: boot auto-start failed: $e")
+                        }
+                    }, 45000)
+                } catch (e: Throwable) {
+                    XposedBridge.log("HotspotKeepalive: boot onReceive failed: $e")
+                }
+            }
+        }
+        ctx.registerReceiver(
+            receiver,
+            android.content.IntentFilter(android.content.Intent.ACTION_BOOT_COMPLETED),
+        )
+    }
+
+    private fun startTetheredHotspot(ctx: Context) {
+        val wifi = ctx.getSystemService(android.net.wifi.WifiManager::class.java) ?: run {
+            XposedBridge.log("HotspotKeepalive: boot: WifiManager unavailable")
+            return
+        }
+        // Hidden @SystemApi: startTetheredHotspot(SoftApConfiguration). null = last config.
+        val candidates = wifi.javaClass.methods.filter { it.name == "startTetheredHotspot" }
+        if (candidates.isEmpty()) {
+            XposedBridge.log("HotspotKeepalive: boot: startTetheredHotspot not found")
+            return
+        }
+        val m = candidates.firstOrNull { it.parameterTypes.size == 1 } ?: candidates[0]
+        XposedBridge.log("HotspotKeepalive: boot: invoking ${m.name} (${m.parameterTypes.size} args)")
+        val args = arrayOfNulls<Any>(m.parameterTypes.size)
+        val result = m.invoke(wifi, *args)
+        XposedBridge.log("HotspotKeepalive: boot: auto-start result=$result")
     }
 }
