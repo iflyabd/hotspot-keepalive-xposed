@@ -175,34 +175,40 @@ object HotspotSettingsHook {
 
         var added = 0
         if (XposedHelpers.callMethod(screen, "findPreference", KEY_BATTERY) == null) {
-            addSwitch(
-                lpparam, screen, context,
-                KEY_BATTERY,
-                "Keep hotspot on (ignore battery)",
-                "Block battery-optimisation auto-disable of hotspot",
-                HotspotHelper.isIgnoreBattery(context),
-            )
-            added++
+            if (addSwitch(
+                    lpparam, screen, context,
+                    KEY_BATTERY,
+                    "Keep hotspot on (ignore battery)",
+                    "Block battery-optimisation auto-disable of hotspot",
+                    HotspotHelper.isIgnoreBattery(context),
+                )
+            ) {
+                added++
+            }
         }
         if (XposedHelpers.callMethod(screen, "findPreference", KEY_THERMAL) == null) {
-            addSwitch(
-                lpparam, screen, context,
-                KEY_THERMAL,
-                "Keep hotspot on (ignore heat)",
-                "Block overheating auto-disable of hotspot",
-                HotspotHelper.isIgnoreThermal(context),
-            )
-            added++
+            if (addSwitch(
+                    lpparam, screen, context,
+                    KEY_THERMAL,
+                    "Keep hotspot on (ignore heat)",
+                    "Block overheating auto-disable of hotspot",
+                    HotspotHelper.isIgnoreThermal(context),
+                )
+            ) {
+                added++
+            }
         }
         if (XposedHelpers.callMethod(screen, "findPreference", KEY_ONBOOT) == null) {
-            addSwitch(
-                lpparam, screen, context,
-                KEY_ONBOOT,
-                "Turn on hotspot at boot",
-                "Automatically start hotspot after every reboot",
-                HotspotHelper.isOnbootEnabled(context),
-            )
-            added++
+            if (addSwitch(
+                    lpparam, screen, context,
+                    KEY_ONBOOT,
+                    "Turn on hotspot at boot",
+                    "Automatically start hotspot after every reboot",
+                    HotspotHelper.isOnbootEnabled(context),
+                )
+            ) {
+                added++
+            }
         }
         if (added == 0) {
             refresh(fragment, screen)
@@ -257,6 +263,15 @@ object HotspotSettingsHook {
         }
     }
 
+    /**
+     * Creates a switch preference. OPlus strips the single-arg (Context)
+     * constructor from its bundled androidx.preference copy, so we prefer the
+     * universal (Context, AttributeSet=null) constructor and try the native
+     * COUI switch first (falls back to androidx). The change-listener
+     * interface is derived from the actual setOnPreferenceChangeListener
+     * method so it matches whichever framework the pref belongs to.
+     * Returns true when the pref was added to the screen.
+     */
     private fun addSwitch(
         lpparam: XC_LoadPackage.LoadPackageParam,
         screen: Any,
@@ -265,28 +280,47 @@ object HotspotSettingsHook {
         title: String,
         summary: String,
         checked: Boolean,
-    ) {
-        val switchClass = XposedHelpers.findClass(
-            "androidx.preference.SwitchPreferenceCompat", lpparam.classLoader,
+    ): Boolean {
+        val candidates = listOf(
+            "com.coui.appcompat.preference.COUISwitchPreference",
+            "androidx.preference.SwitchPreferenceCompat",
         )
-        val pref = switchClass.getConstructor(Context::class.java).newInstance(context)
-        XposedHelpers.callMethod(pref, "setKey", key)
-        XposedHelpers.callMethod(pref, "setTitle", title)
-        XposedHelpers.callMethod(pref, "setSummary", summary)
-        XposedHelpers.callMethod(pref, "setChecked", checked)
-        val listenerClass = XposedHelpers.findClass(
-            "androidx.preference.Preference\$OnPreferenceChangeListener", lpparam.classLoader,
-        )
-        val proxy = java.lang.reflect.Proxy.newProxyInstance(
-            lpparam.classLoader, arrayOf(listenerClass),
-        ) { _, _, args ->
-            val newValue = args!![1] as Boolean
-            Settings.Global.putInt(context.contentResolver, key, if (newValue) 1 else 0)
-            XposedBridge.log("HotspotKeepalive: $key -> $newValue")
-            true
+        for (name in candidates) {
+            try {
+                val cls = XposedHelpers.findClass(name, lpparam.classLoader)
+                val pref = try {
+                    cls.getConstructor(
+                        Context::class.java,
+                        android.util.AttributeSet::class.java,
+                    ).newInstance(context, null)
+                } catch (_: Throwable) {
+                    cls.getConstructor(Context::class.java).newInstance(context)
+                }
+                XposedHelpers.callMethod(pref, "setKey", key)
+                XposedHelpers.callMethod(pref, "setTitle", title)
+                XposedHelpers.callMethod(pref, "setSummary", summary)
+                XposedHelpers.callMethod(pref, "setChecked", checked)
+                val setter = pref.javaClass.methods.firstOrNull {
+                    it.name == "setOnPreferenceChangeListener" && it.parameterTypes.size == 1
+                } ?: throw NoSuchMethodException("setOnPreferenceChangeListener")
+                val iface = setter.parameterTypes[0]
+                val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                    lpparam.classLoader, arrayOf(iface),
+                ) { _, _, args ->
+                    val newValue = args!![1] as Boolean
+                    Settings.Global.putInt(context.contentResolver, key, if (newValue) 1 else 0)
+                    XposedBridge.log("HotspotKeepalive: $key -> $newValue")
+                    true
+                }
+                setter.invoke(pref, proxy)
+                XposedHelpers.callMethod(screen, "addPreference", pref)
+                XposedBridge.log("HotspotKeepalive: added $key via $name")
+                return true
+            } catch (e: Throwable) {
+                XposedBridge.log("HotspotKeepalive: pref $name failed: $e")
+            }
         }
-        XposedHelpers.callMethod(pref, "setOnPreferenceChangeListener", proxy)
-        XposedHelpers.callMethod(screen, "addPreference", pref)
+        return false
     }
 
     private fun refresh(fragment: Any, screen: Any) {
