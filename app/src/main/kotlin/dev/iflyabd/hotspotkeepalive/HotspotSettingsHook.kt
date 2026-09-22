@@ -97,28 +97,8 @@ object HotspotSettingsHook {
             )
         } catch (_: Throwable) {
         }
-        // OPlus COUI panel (hotspot settings in WirelessSettings).
-        try {
-            XposedHelpers.findAndHookMethod(
-                "com.coui.appcompat.panel.COUIPanelFragment",
-                lpparam.classLoader,
-                "onStart",
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            logScreen("coui", param.thisObject)
-                            maybeInject(param.thisObject, lpparam)
-                        } catch (e: Throwable) {
-                            XposedBridge.log("HotspotKeepalive: coui inject failed: $e")
-                        }
-                    }
-                },
-            )
-            XposedBridge.log("HotspotKeepalive: COUIPanelFragment hook installed")
-        } catch (e: Throwable) {
-            XposedBridge.log("HotspotKeepalive: COUIPanelFragment hook failed: $e")
-        }
         // Generic fragment discovery: log hotspot-ish screens we don't otherwise cover.
+        // (COUIPanelFragment declares no onStart of its own, so it is covered here.)
         try {
             XposedHelpers.findAndHookMethod(
                 "androidx.fragment.app.Fragment",
@@ -169,13 +149,28 @@ object HotspotSettingsHook {
     private fun maybeInject(fragment: Any, lpparam: XC_LoadPackage.LoadPackageParam) {
         logScreen("inject", fragment)
         val screen = XposedHelpers.callMethod(fragment, "getPreferenceScreen") ?: return
-        // Anchor: stock auto-off toggle (AOSP or OPlus key). If absent this is not
-        // the hotspot screen.
+        val keys = mutableSetOf<String>()
+        try {
+            val n = XposedHelpers.callMethod(screen, "getPreferenceCount") as Int
+            for (i in 0 until n) {
+                val p = XposedHelpers.callMethod(screen, "getPreference", i)
+                (XposedHelpers.callMethod(p, "getKey") as? String)?.let { keys += it }
+            }
+        } catch (_: Throwable) {
+        }
+        // Anchor: stock auto-off toggle (AOSP or OPlus key). On OOS the
+        // WifiTetherSettings screen only has group_name/prompt/advance_group
+        // (OPlus removed the AOSP toggle), so fall back to anchoring below
+        // advance_group on that exact screen.
         // NOTE: we never modify or remove the anchor — only add below it — so the
         // stock hotspot switch keeps working exactly as before.
         val anchor = ANCHORS.firstOrNull { key ->
             XposedHelpers.callMethod(screen, "findPreference", key) != null
-        } ?: return
+        } ?: if (keys.containsAll(listOf("group_name", "prompt", "advance_group"))) {
+            "advance_group"
+        } else {
+            return
+        }
         val context = XposedHelpers.callMethod(screen, "getContext") as Context
 
         var added = 0
