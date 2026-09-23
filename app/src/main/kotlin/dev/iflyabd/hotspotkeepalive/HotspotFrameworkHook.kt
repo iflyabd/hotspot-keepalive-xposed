@@ -308,7 +308,11 @@ object HotspotFrameworkHook {
         return try {
             val tm = ctx.getSystemService(android.net.TetheringManager::class.java)
                 ?: return emptyList()
-            tm.tetheredIfaces.toList()
+            // getTetheredIfaces() is hidden (@SystemApi) — reflect it.
+            val m = tm.javaClass.methods.firstOrNull {
+                it.name == "getTetheredIfaces" && it.parameterTypes.isEmpty()
+            } ?: return emptyList()
+            (m.invoke(tm) as? Array<String>)?.toList() ?: emptyList()
         } catch (e: Throwable) {
             XposedBridge.log("HotspotKeepalive: tetheredIfaces failed: $e")
             emptyList()
