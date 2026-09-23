@@ -32,6 +32,7 @@ object HotspotSettingsHook {
     private const val KEY_BATTERY = "hotspot_keepalive_ignore_battery"
     private const val KEY_THERMAL = "hotspot_keepalive_ignore_thermal"
     private const val KEY_ONBOOT = "hotspot_keepalive_onboot"
+    private const val KEY_AIRPLANE = "hotspot_keepalive_ignore_airplane"
     private const val OBSERVER_TAG = "hotspot_keepalive_observer"
 
     /** Stock auto-off keys: AOSP + OPlus variants. Injection anchors below whichever is present. */
@@ -210,12 +211,24 @@ object HotspotSettingsHook {
                 added++
             }
         }
+        if (XposedHelpers.callMethod(screen, "findPreference", KEY_AIRPLANE) == null) {
+            if (addSwitch(
+                    lpparam, screen, context,
+                    KEY_AIRPLANE,
+                    "Keep hotspot on in airplane mode",
+                    "Restart hotspot if airplane mode turns it off",
+                    HotspotHelper.isIgnoreAirplane(context),
+                )
+            ) {
+                added++
+            }
+        }
         if (added == 0) {
             refresh(fragment, screen)
             return
         }
 
-        // Order all three directly below the anchor.
+        // Order all four directly below the anchor.
         val count = XposedHelpers.callMethod(screen, "getPreferenceCount") as Int
         var anchorOrder = Int.MAX_VALUE
         for (i in 0 until count) {
@@ -225,13 +238,13 @@ object HotspotSettingsHook {
                 break
             }
         }
-        val ours = setOf(KEY_BATTERY, KEY_THERMAL, KEY_ONBOOT)
+        val ours = setOf(KEY_BATTERY, KEY_THERMAL, KEY_ONBOOT, KEY_AIRPLANE)
         for (i in 0 until count) {
             val p = XposedHelpers.callMethod(screen, "getPreference", i)
             val key = XposedHelpers.callMethod(p, "getKey") as? String
             if (key in ours) continue
             val order = XposedHelpers.callMethod(p, "getOrder") as Int
-            if (order > anchorOrder) XposedHelpers.callMethod(p, "setOrder", order + 3)
+            if (order > anchorOrder) XposedHelpers.callMethod(p, "setOrder", order + 4)
         }
         (XposedHelpers.callMethod(screen, "findPreference", KEY_BATTERY))?.let {
             XposedHelpers.callMethod(it, "setOrder", anchorOrder + 1)
@@ -242,7 +255,10 @@ object HotspotSettingsHook {
         (XposedHelpers.callMethod(screen, "findPreference", KEY_ONBOOT))?.let {
             XposedHelpers.callMethod(it, "setOrder", anchorOrder + 3)
         }
-        XposedBridge.log("HotspotKeepalive: injected 3 toggles below hotspot auto-off")
+        (XposedHelpers.callMethod(screen, "findPreference", KEY_AIRPLANE))?.let {
+            XposedHelpers.callMethod(it, "setOrder", anchorOrder + 4)
+        }
+        XposedBridge.log("HotspotKeepalive: injected 4 toggles below hotspot auto-off")
 
         if (XposedHelpers.getAdditionalInstanceField(fragment, OBSERVER_TAG) == null) {
             val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
@@ -258,6 +274,9 @@ object HotspotSettingsHook {
             )
             context.contentResolver.registerContentObserver(
                 Settings.Global.getUriFor(KEY_ONBOOT), false, observer,
+            )
+            context.contentResolver.registerContentObserver(
+                Settings.Global.getUriFor(KEY_AIRPLANE), false, observer,
             )
             XposedHelpers.setAdditionalInstanceField(fragment, OBSERVER_TAG, observer)
         }
@@ -334,6 +353,9 @@ object HotspotSettingsHook {
             }
             (XposedHelpers.callMethod(screen, "findPreference", KEY_ONBOOT))?.let {
                 XposedHelpers.callMethod(it, "setChecked", HotspotHelper.isOnbootEnabled(context))
+            }
+            (XposedHelpers.callMethod(screen, "findPreference", KEY_AIRPLANE))?.let {
+                XposedHelpers.callMethod(it, "setChecked", HotspotHelper.isIgnoreAirplane(context))
             }
         } catch (e: Throwable) {
             XposedBridge.log("HotspotKeepalive: refresh failed: $e")

@@ -237,47 +237,126 @@ object HotspotFrameworkHook {
         val ctx = currentApp() ?: return
         if (XposedHelpers.getAdditionalInstanceField(ctx, "hotspot_boot_registered") != null) return
         XposedHelpers.setAdditionalInstanceField(ctx, "hotspot_boot_registered", true)
-        val receiver = object : android.content.BroadcastReceiver() {
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        // 1. Boot auto-start (with retries; always logs so failures are visible).
+        val bootReceiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(c: Context, intent: android.content.Intent) {
                 try {
                     val onboot = android.provider.Settings.Global.getInt(
                         c.contentResolver, HotspotHelper.KEY_ONBOOT, 0,
                     ) == 1
+                    XposedBridge.log("HotspotKeepalive: boot completed, onboot=$onboot")
                     if (!onboot) return
-                    XposedBridge.log("HotspotKeepalive: boot: will auto-start hotspot in 45s")
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        try {
-                            startTetheredHotspot(c)
-                        } catch (e: Throwable) {
-                            XposedBridge.log("HotspotKeepalive: boot auto-start failed: $e")
-                        }
-                    }, 45000)
+                    for (delay in listOf(45000L, 100000L, 170000L)) {
+                        mainHandler.postDelayed({
+                            try {
+                                if (isHotspotUp(c)) {
+                                    XposedBridge.log("HotspotKeepalive: boot: hotspot already up, done")
+                                } else {
+                                    val ok = startTetheredHotspot(c)
+                                    XposedBridge.log("HotspotKeepalive: boot: auto-start attempt result=$ok")
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.log("HotspotKeepalive: boot auto-start failed: $e")
+                            }
+                        }, delay)
+                    }
                 } catch (e: Throwable) {
                     XposedBridge.log("HotspotKeepalive: boot onReceive failed: $e")
                 }
             }
         }
         ctx.registerReceiver(
-            receiver,
+            bootReceiver,
             android.content.IntentFilter(android.content.Intent.ACTION_BOOT_COMPLETED),
         )
+        // 2. Airplane-mode keepalive: restart hotspot if airplane mode kills it.
+        val airplaneReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: android.content.Intent) {
+                try {
+                    if (intent.action != android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED) return
+                    val airplaneOn = intent.getBooleanExtra("state", false)
+                    XposedBridge.log("HotspotKeepalive: airplane changed, on=$airplaneOn")
+                    if (!airplaneOn) return
+                    val keep = android.provider.Settings.Global.getInt(
+                        c.contentResolver, HotspotHelper.KEY_IGNORE_AIRPLANE, 0,
+                    ) == 1
+                    if (!keep) return
+                    val wasUp = isHotspotUp(c)
+                    XposedBridge.log("HotspotKeepalive: airplane on, keepalive=on, hotspotWasUp=$wasUp")
+                    if (!wasUp) return
+                    mainHandler.postDelayed({
+                        try {
+                            restartHotspotSequence(c, mainHandler)
+                        } catch (e: Throwable) {
+                            XposedBridge.log("HotspotKeepalive: airplane restart failed: $e")
+                        }
+                    }, 8000)
+                } catch (e: Throwable) {
+                    XposedBridge.log("HotspotKeepalive: airplane onReceive failed: $e")
+                }
+            }
+        }
+        ctx.registerReceiver(
+            airplaneReceiver,
+            android.content.IntentFilter(android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED),
+        )
+        XposedBridge.log("HotspotKeepalive: boot + airplane receivers registered")
     }
 
-    private fun startTetheredHotspot(ctx: Context) {
+    private fun tetheredIfaces(ctx: Context): List<String> {
+        return try {
+            val tm = ctx.getSystemService(android.net.TetheringManager::class.java)
+                ?: return emptyList()
+            tm.tetheredIfaces.toList()
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: tetheredIfaces failed: $e")
+            emptyList()
+        }
+    }
+
+    private fun isHotspotUp(ctx: Context): Boolean {
+        return tetheredIfaces(ctx).any {
+            it.startsWith("wlan") || it.startsWith("softap") || it.startsWith("ap_")
+        }
+    }
+
+    private fun restartHotspotSequence(ctx: Context, handler: android.os.Handler) {
+        try {
+            val wifi = ctx.getSystemService(android.net.wifi.WifiManager::class.java)
+            if (wifi != null && !wifi.isWifiEnabled) {
+                XposedBridge.log("HotspotKeepalive: airplane: re-enabling wifi")
+                wifi.isWifiEnabled = true
+            }
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: airplane: wifi re-enable failed: $e")
+        }
+        handler.postDelayed({
+            val ok = startTetheredHotspot(ctx)
+            XposedBridge.log("HotspotKeepalive: airplane: hotspot restart result=$ok")
+        }, 2000)
+    }
+
+    private fun startTetheredHotspot(ctx: Context): Boolean {
         val wifi = ctx.getSystemService(android.net.wifi.WifiManager::class.java) ?: run {
-            XposedBridge.log("HotspotKeepalive: boot: WifiManager unavailable")
-            return
+            XposedBridge.log("HotspotKeepalive: WifiManager unavailable")
+            return false
         }
         // Hidden @SystemApi: startTetheredHotspot(SoftApConfiguration). null = last config.
         val candidates = wifi.javaClass.methods.filter { it.name == "startTetheredHotspot" }
         if (candidates.isEmpty()) {
-            XposedBridge.log("HotspotKeepalive: boot: startTetheredHotspot not found")
-            return
+            XposedBridge.log("HotspotKeepalive: startTetheredHotspot not found")
+            return false
         }
         val m = candidates.firstOrNull { it.parameterTypes.size == 1 } ?: candidates[0]
-        XposedBridge.log("HotspotKeepalive: boot: invoking ${m.name} (${m.parameterTypes.size} args)")
+        XposedBridge.log("HotspotKeepalive: invoking ${m.name} (${m.parameterTypes.size} args)")
         val args = arrayOfNulls<Any>(m.parameterTypes.size)
-        val result = m.invoke(wifi, *args)
-        XposedBridge.log("HotspotKeepalive: boot: auto-start result=$result")
+        return try {
+            val result = m.invoke(wifi, *args)
+            (result as? Boolean) ?: true
+        } catch (e: Throwable) {
+            XposedBridge.log("HotspotKeepalive: startTetheredHotspot invoke failed: $e")
+            false
+        }
     }
 }

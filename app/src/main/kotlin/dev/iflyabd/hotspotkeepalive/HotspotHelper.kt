@@ -8,6 +8,7 @@ object HotspotHelper {
     const val KEY_IGNORE_BATTERY = "hotspot_keepalive_ignore_battery"
     const val KEY_IGNORE_THERMAL = "hotspot_keepalive_ignore_thermal"
     const val KEY_ONBOOT = "hotspot_keepalive_onboot"
+    const val KEY_IGNORE_AIRPLANE = "hotspot_keepalive_ignore_airplane"
 
     fun isIgnoreBattery(context: Context): Boolean {
         return try {
@@ -28,6 +29,14 @@ object HotspotHelper {
     fun isOnbootEnabled(context: Context): Boolean {
         return try {
             Settings.Global.getInt(context.contentResolver, KEY_ONBOOT, 0) == 1
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun isIgnoreAirplane(context: Context): Boolean {
+        return try {
+            Settings.Global.getInt(context.contentResolver, KEY_IGNORE_AIRPLANE, 0) == 1
         } catch (_: Throwable) {
             false
         }
